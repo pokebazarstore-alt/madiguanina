@@ -2,8 +2,8 @@ name: Vigilar Mercari
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # cada 2 horas (hora UTC)
-  workflow_dispatch:         # permite lanzarlo a mano desde la pestaña Actions
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: mercari
@@ -13,17 +13,19 @@ jobs:
   vigilar:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: mercari-watch
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: mercari-watch/requirements.txt
       - run: pip install -r requirements.txt
       - run: python -m playwright install --with-deps chromium
       - run: python mercari_watch.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          # Opcional: vigilar solo algunas pestañas, separadas por "|"
-          # SHEETS: "LV X|Prime"
