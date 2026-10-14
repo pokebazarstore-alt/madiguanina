@@ -3,7 +3,8 @@
 
 Por cada celda con un enlace de jp.mercari.com/search carga la búsqueda (ordenada por
 más recientes y solo en venta), compara con los anuncios ya vistos y, si hay nuevos,
-colorea la celda y le pone una nota con el detalle.
+colorea la celda y le pone una nota con el detalle. En cada ejecución quita de la nota
+los anuncios que ya no están a la venta; si no queda ninguno, limpia la nota y el color.
 
 Variables de entorno: SPREADSHEET_ID, GOOGLE_CREDENTIALS (JSON de la cuenta de servicio),
 SHEETS (opcional, pestañas separadas por "|").
@@ -16,12 +17,15 @@ from zoneinfo import ZoneInfo
 
 STATE_TITLE = "_mercari_estado"
 COLORS_TITLE = "_mercari_colores"
+PENDING_TITLE = "_mercari_pendientes"
 ALERT_COLOR = {"red": 1.0, "green": 0.84, "blue": 0.35}
 MAX_SEEN = 300
 TARGET_ITEMS = 90
 MAX_ALERT_BATCH = 25  # si salen más 'nuevos' de golpe, se considera lectura anómala
 STATE_VERSION = "2"
 MAX_NOTE = 1800
+MAX_LISTED = 8
+MISS_TO_DROP = 2  # ejecuciones seguidas sin aparecer (vendido/retirado) antes de quitarlo de la nota
 NO_RESULT = "出品された商品がありません"
 TZ = ZoneInfo("Europe/Madrid")
 
@@ -65,21 +69,31 @@ def open_sheet():
 
 
 def hex_color(bg):
-    """Color de la API -> '#rrggbb'. Blanco/sin color -> '' (se restaura como 'sin color')."""
+    """Color de la API -> '#rrggbb'. Blanco/sin color -> '' (= 'sin color')."""
     if not bg:
         return ""
     r, g, b = (round(bg.get(k, 0) * 255) for k in ("red", "green", "blue"))
     return "" if (r, g, b) == (255, 255, 255) else f"#{r:02x}{g:02x}{b:02x}"
 
 
-def load_colors(sh):
+def hex_to_rgb(h):
+    return {"red": int(h[1:3], 16) / 255, "green": int(h[3:5], 16) / 255,
+            "blue": int(h[5:7], 16) / 255}
+
+
+def hidden_sheet(sh, title, header):
     import gspread
     try:
-        ws = sh.worksheet(COLORS_TITLE)
+        return sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(COLORS_TITLE, rows=500, cols=2)
-        ws.update(range_name="A1", values=[["celda (hoja|fila|col)", "color_original"]])
+        ws = sh.add_worksheet(title, rows=500, cols=len(header))
+        ws.update(range_name="A1", values=[header])
         ws.hide()
+        return ws
+
+
+def load_colors(sh):
+    ws = hidden_sheet(sh, COLORS_TITLE, ["celda (hoja|fila|col)", "color_original"])
     return ws, {r[0]: (r[1] if len(r) > 1 else "") for r in ws.get_all_values()[1:] if r and r[0]}
 
 
@@ -87,6 +101,24 @@ def save_colors(ws, colors):
     ws.clear()
     ws.update(range_name="A1", values=[["celda (hoja|fila|col)", "color_original"]]
               + [[k, v] for k, v in colors.items()])
+
+
+def load_pending(sh):
+    ws = hidden_sheet(sh, PENDING_TITLE, ["hoja|url", "anuncios_sin_revisar"])
+    out = {}
+    for r in ws.get_all_values()[1:]:
+        if r and r[0] and len(r) > 1 and r[1]:
+            try:
+                out[r[0]] = json.loads(r[1])
+            except json.JSONDecodeError:
+                pass
+    return ws, out
+
+
+def save_pending(ws, pending):
+    ws.clear()
+    ws.update(range_name="A1", values=[["hoja|url", "anuncios_sin_revisar"]]
+              + [[k, json.dumps(v, ensure_ascii=False)] for k, v in pending.items() if v])
 
 
 def collect_links(sh, only):
@@ -97,7 +129,7 @@ def collect_links(sh, only):
     links = []
     for s in meta["sheets"]:
         title = s["properties"]["title"]
-        if title in (STATE_TITLE, COLORS_TITLE) or (only and title not in only):
+        if title in (STATE_TITLE, COLORS_TITLE, PENDING_TITLE) or (only and title not in only):
             continue
         for d in s.get("data", []):
             r0, c0 = d.get("startRow", 0), d.get("startColumn", 0)
@@ -115,18 +147,13 @@ def collect_links(sh, only):
                         links.append(dict(sheetId=s["properties"]["sheetId"], title=title,
                                           row=r0 + r, col=c0 + c, url=url,
                                           note=cell.get("note", ""),
-                                          bg=cell.get("userEnteredFormat", {}).get("backgroundColor")))
+                                          bg=hex_color(cell.get("userEnteredFormat", {})
+                                                       .get("backgroundColor"))))
     return links
 
 
 def load_state(sh):
-    import gspread
-    try:
-        ws = sh.worksheet(STATE_TITLE)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(STATE_TITLE, rows=500, cols=4)
-        ws.update(range_name="A1", values=[["clave", "ids_vistos", "ultima_revision", "estado"]])
-        ws.hide()
+    ws = hidden_sheet(sh, STATE_TITLE, ["clave", "ids_vistos", "ultima_revision", "estado"])
     state = {}
     rows = ws.get_all_values()[1:]
     version = next((r[1] for r in rows if r and r[0] == "__version__"), None)
@@ -182,27 +209,95 @@ def scrape(page, url):
     return page.evaluate(EXTRACT_JS)
 
 
-def rgb_hex(bg):
-    if not bg:
-        return "none"
-    return "#%02x%02x%02x" % tuple(round(bg.get(k, 0) * 255) for k in ("red", "green", "blue"))
+# ---------------------------------------------------------------- Lógica de avisos
+def build_note(pend):
+    lines = [f"🆕 {len(pend)} anuncio(s) a la venta sin revisar"]
+    for p in pend[:MAX_LISTED]:
+        price = f" · ¥{p['price']}" if p.get("price") else ""
+        lines.append(f"• {p['label'] or p['id']}{price}\n  {p['href']}\n  (detectado {p['ts']})")
+    if len(pend) > MAX_LISTED:
+        lines.append(f"… y {len(pend) - MAX_LISTED} más")
+    return "\n".join(lines)[:MAX_NOTE]
 
 
-ORIG_RE = re.compile(r"\n?\[orig:([^\]]+)\]")
+def cell_range(ln):
+    return {"sheetId": ln["sheetId"], "startRowIndex": ln["row"], "endRowIndex": ln["row"] + 1,
+            "startColumnIndex": ln["col"], "endColumnIndex": ln["col"] + 1}
 
 
-def build_note(old_note, new_items, orig):
-    stamp = datetime.now(TZ).strftime("%d/%m %H:%M")
-    lines = [f"🆕 {len(new_items)} anuncio(s) nuevo(s) · {stamp}"]
-    for it in new_items[:5]:
-        price = f" · ¥{it['price']}" if it.get('price') else ""
-        lines.append(f"• {it['label'] or it['id']}{price}\n  {it['href']}")
-    if len(new_items) > 5:
-        lines.append(f"… y {len(new_items) - 5} más")
-    text = "\n".join(lines)
-    if old_note.startswith("🆕"):
-        text += "\n\n— anteriores —\n" + ORIG_RE.sub("", old_note).strip()
-    return text[:MAX_NOTE] + f"\n[orig:{orig}]"
+def process_link(ln, url, items, state, pending, colors, status, requests_, now=None):
+    """Actualiza estado/pendientes de un enlace con la lectura `items` (lista) y añade a
+    `requests_` los cambios de nota/color necesarios. Devuelve nº de anuncios nuevos."""
+    now = now or datetime.now(TZ).strftime("%d/%m %H:%M")
+    ids = [it["id"] for it in items]
+    cur = set(ids)
+    pkey = f"{ln['sheetId']}|{url}"
+    ckey = f"{ln['sheetId']}|{ln['row']}|{ln['col']}"
+    flagged = ln["note"].startswith("🆕")
+
+    new = []
+    if url not in state:
+        state[url] = ids
+        status[url] = "línea base"
+    else:
+        seen = set(state[url])
+        # Los anuncios nuevos van los primeros (orden "más recientes"). Solo se cuentan los que
+        # están antes del primer anuncio ya visto; así, si se vende uno y sube otro viejo desde
+        # el final de la lista, no se confunde con un anuncio nuevo.
+        new = []
+        for it in items:
+            if it["id"] in seen:
+                break
+            new.append(it)
+        state[url] = ids + [x for x in state[url] if x not in cur]
+        status[url] = f"ok, {len(new)} nuevos"
+        if len(new) > MAX_ALERT_BATCH:
+            print(f"   ⚠ {len(new)} 'nuevos' de golpe: lectura anómala, se ignora")
+            status[url] = "lectura anómala (ignorada)"
+            new = []
+
+    # pendientes: si la nota ya no tiene aviso (la borraste), se empieza limpio
+    pend = pending.get(pkey, []) if flagged else []
+    kept = []
+    for p in pend:
+        if p["id"] in cur:
+            p["miss"] = 0
+            kept.append(p)
+        else:
+            p["miss"] = p.get("miss", 0) + 1  # vendido/retirado: se quita al repetirse
+            if p["miss"] < MISS_TO_DROP:
+                kept.append(p)
+            else:
+                print(f"   ✖ vendido/retirado: {p['label'][:40]}")
+    pend = kept
+    have = {p["id"] for p in pend}
+    pend = [dict(id=it["id"], label=it["label"], price=it.get("price", ""), href=it["href"],
+                 ts=now, miss=0) for it in new if it["id"] not in have] + pend
+    if new:
+        print(f"   🆕 {len(new)} nuevos")
+    if pend:
+        pending[pkey] = pend
+    else:
+        pending.pop(pkey, None)
+
+    if pend:
+        note = build_note(pend)
+        if note != ln["note"] or ln["bg"] != hex_color(ALERT_COLOR):
+            if ckey not in colors:  # recordar el color original una sola vez
+                colors[ckey] = "" if ln["bg"] == hex_color(ALERT_COLOR) else ln["bg"]
+            requests_.append({"updateCells": {
+                "range": cell_range(ln),
+                "rows": [{"values": [{"note": note,
+                                      "userEnteredFormat": {"backgroundColor": ALERT_COLOR}}]}],
+                "fields": "note,userEnteredFormat.backgroundColor"}})
+    elif flagged:  # ya no queda nada a la venta: limpiar nota y devolver el color
+        orig = colors.pop(ckey, "")
+        value = {"userEnteredFormat": {"backgroundColor": hex_to_rgb(orig)}} if orig else {}
+        requests_.append({"updateCells": {
+            "range": cell_range(ln), "rows": [{"values": [value]}],
+            "fields": "note,userEnteredFormat.backgroundColor"}})
+        print("   ✔ todo vendido: aviso retirado")
+    return len(new)
 
 
 def main():
@@ -215,15 +310,16 @@ def main():
     from playwright.sync_api import sync_playwright
 
     if args.url:
-        links, sh, state_ws, state = [dict(url=args.url, title="-", row=0, col=0,
-                                           sheetId=0, note="", bg="")], None, None, {}
-        colors_ws, colors = None, {}
+        links = [dict(url=args.url, title="-", row=0, col=0, sheetId=0, note="", bg="")]
+        sh = state_ws = colors_ws = pending_ws = None
+        state, colors, pending = {}, {}, {}
     else:
         sh = open_sheet()
         only = [s for s in os.environ.get("SHEETS", "").split("|") if s]
         links = collect_links(sh, only)
         state_ws, state = load_state(sh)
         colors_ws, colors = load_colors(sh)
+        pending_ws, pending = load_pending(sh)
         print(f"{len(links)} enlaces de Mercari encontrados")
     if args.limit:
         links = links[:args.limit]
@@ -249,34 +345,9 @@ def main():
                 status[url] = "ERROR: no se pudo leer (¿bloqueo?)"
                 print(f"{tag}: FALLO")
             else:
-                ids = [it["id"] for it in items]
-                print(f"{tag}: {len(ids)} anuncios" + (f" · ej: {items[0]['label'][:50]}" if items else ""))
-                if url not in state:
-                    state[url] = ids
-                    status[url] = "línea base"
-                else:
-                    seen = set(state[url])
-                    new = [it for it in items if it["id"] not in seen]
-                    state[url] = ids + [x for x in state[url] if x not in set(ids)]
-                    status[url] = f"ok, {len(new)} nuevos"
-                    if len(new) > MAX_ALERT_BATCH:
-                        print(f"   ⚠ {len(new)} 'nuevos' de golpe: lectura anómala, se ignora")
-                        status[url] = "lectura anómala (ignorada)"
-                    elif new:
-                        print(f"   🆕 {len(new)} nuevos")
-                        m = ORIG_RE.search(ln["note"]) if ln["note"].startswith("🆕") else None
-                        orig = m.group(1) if m else rgb_hex(ln.get("bg"))
-                        ckey = f"{ln['sheetId']}|{ln['row']}|{ln['col']}"
-                        if ckey not in colors:  # recordar el color original una sola vez
-                            colors[ckey] = "" if ln["bg"] == hex_color(ALERT_COLOR) else ln["bg"]
-                        requests_.append({"updateCells": {
-                            "range": {"sheetId": ln["sheetId"], "startRowIndex": ln["row"],
-                                      "endRowIndex": ln["row"] + 1, "startColumnIndex": ln["col"],
-                                      "endColumnIndex": ln["col"] + 1},
-                            "rows": [{"values": [{
-                                "note": build_note(ln["note"], new, orig),
-                                "userEnteredFormat": {"backgroundColor": ALERT_COLOR}}]}],
-                            "fields": "note,userEnteredFormat.backgroundColor"}})
+                print(f"{tag}: {len(items)} anuncios"
+                      + (f" · ej: {items[0]['label'][:50]}" if items else ""))
+                process_link(ln, url, items, state, pending, colors, status, requests_)
             time.sleep(random.uniform(2.5, 5.5))
         browser.close()
 
@@ -285,7 +356,8 @@ def main():
             sh.batch_update({"requests": requests_})
         save_state(state_ws, state, status)
         save_colors(colors_ws, colors)
-    print(f"Hecho: {len(requests_)} celdas avisadas, {failures} fallos de {len(links)}")
+        save_pending(pending_ws, pending)
+    print(f"Hecho: {len(requests_)} celdas actualizadas, {failures} fallos de {len(links)}")
     if links and failures > len(links) / 2:
         sys.exit(1)  # GitHub te mandará un email de "workflow failed"
 
