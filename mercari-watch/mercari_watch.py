@@ -18,7 +18,15 @@ from zoneinfo import ZoneInfo
 STATE_TITLE = "_mercari_estado"
 COLORS_TITLE = "_mercari_colores"
 PENDING_TITLE = "_mercari_pendientes"
-ALERT_COLOR = {"red": 1.0, "green": 0.84, "blue": 0.35}
+# Color según nº de anuncios sin revisar: 1-5 verde, 6-15 amarillo, 16 o más rojo
+COLOR_GREEN = {"red": 0.58, "green": 0.84, "blue": 0.52}
+COLOR_YELLOW = {"red": 1.0, "green": 0.84, "blue": 0.35}
+COLOR_RED = {"red": 0.93, "green": 0.40, "blue": 0.38}
+
+
+def alert_color(n):
+    return COLOR_GREEN if n <= 5 else COLOR_YELLOW if n <= 15 else COLOR_RED
+
 MAX_SEEN = 300
 TARGET_ITEMS = 90
 MAX_ALERT_BATCH = 25  # si salen más 'nuevos' de golpe, se considera lectura anómala
@@ -74,6 +82,10 @@ def hex_color(bg):
         return ""
     r, g, b = (round(bg.get(k, 0) * 255) for k in ("red", "green", "blue"))
     return "" if (r, g, b) == (255, 255, 255) else f"#{r:02x}{g:02x}{b:02x}"
+
+
+def alert_hexes():
+    return {hex_color(c) for c in (COLOR_GREEN, COLOR_YELLOW, COLOR_RED)}
 
 
 def hex_to_rgb(h):
@@ -282,13 +294,14 @@ def process_link(ln, url, items, state, pending, colors, status, requests_, now=
 
     if pend:
         note = build_note(pend)
-        if note != ln["note"] or ln["bg"] != hex_color(ALERT_COLOR):
+        color = alert_color(len(pend))
+        if note != ln["note"] or ln["bg"] != hex_color(color):
             if ckey not in colors:  # recordar el color original una sola vez
-                colors[ckey] = "" if ln["bg"] == hex_color(ALERT_COLOR) else ln["bg"]
+                colors[ckey] = "" if ln["bg"] in alert_hexes() else ln["bg"]
             requests_.append({"updateCells": {
                 "range": cell_range(ln),
                 "rows": [{"values": [{"note": note,
-                                      "userEnteredFormat": {"backgroundColor": ALERT_COLOR}}]}],
+                                      "userEnteredFormat": {"backgroundColor": color}}]}],
                 "fields": "note,userEnteredFormat.backgroundColor"}})
     elif flagged:  # ya no queda nada a la venta: limpiar nota y devolver el color
         orig = colors.pop(ckey, "")
