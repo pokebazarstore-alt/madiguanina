@@ -15,6 +15,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 STATE_TITLE = "_mercari_estado"
+COLORS_TITLE = "_mercari_colores"
 ALERT_COLOR = {"red": 1.0, "green": 0.84, "blue": 0.35}
 MAX_SEEN = 300
 TARGET_ITEMS = 90
@@ -63,14 +64,40 @@ def open_sheet():
     return gspread.authorize(creds).open_by_key(os.environ["SPREADSHEET_ID"])
 
 
+def hex_color(bg):
+    """Color de la API -> '#rrggbb'. Blanco/sin color -> '' (se restaura como 'sin color')."""
+    if not bg:
+        return ""
+    r, g, b = (round(bg.get(k, 0) * 255) for k in ("red", "green", "blue"))
+    return "" if (r, g, b) == (255, 255, 255) else f"#{r:02x}{g:02x}{b:02x}"
+
+
+def load_colors(sh):
+    import gspread
+    try:
+        ws = sh.worksheet(COLORS_TITLE)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(COLORS_TITLE, rows=500, cols=2)
+        ws.update(range_name="A1", values=[["celda (hoja|fila|col)", "color_original"]])
+        ws.hide()
+    return ws, {r[0]: (r[1] if len(r) > 1 else "") for r in ws.get_all_values()[1:] if r and r[0]}
+
+
+def save_colors(ws, colors):
+    ws.clear()
+    ws.update(range_name="A1", values=[["celda (hoja|fila|col)", "color_original"]]
+              + [[k, v] for k, v in colors.items()])
+
+
 def collect_links(sh, only):
     fields = ("sheets(properties(title,sheetId),data(startRow,startColumn,rowData(values("
-              "hyperlink,note,userEnteredValue/formulaValue,textFormatRuns/format/link))))")
+              "hyperlink,note,userEnteredFormat/backgroundColor,userEnteredValue/formulaValue,"
+              "textFormatRuns/format/link))))")
     meta = sh.fetch_sheet_metadata(params={"includeGridData": "true", "fields": fields})
     links = []
     for s in meta["sheets"]:
         title = s["properties"]["title"]
-        if title == STATE_TITLE or (only and title not in only):
+        if title in (STATE_TITLE, COLORS_TITLE) or (only and title not in only):
             continue
         for d in s.get("data", []):
             r0, c0 = d.get("startRow", 0), d.get("startColumn", 0)
@@ -87,7 +114,8 @@ def collect_links(sh, only):
                     if url and "mercari.com" in url and "/search" in url:
                         links.append(dict(sheetId=s["properties"]["sheetId"], title=title,
                                           row=r0 + r, col=c0 + c, url=url,
-                                          note=cell.get("note", "")))
+                                          note=cell.get("note", ""),
+                                          bg=cell.get("userEnteredFormat", {}).get("backgroundColor")))
     return links
 
 
@@ -154,7 +182,16 @@ def scrape(page, url):
     return page.evaluate(EXTRACT_JS)
 
 
-def build_note(old_note, new_items):
+def rgb_hex(bg):
+    if not bg:
+        return "none"
+    return "#%02x%02x%02x" % tuple(round(bg.get(k, 0) * 255) for k in ("red", "green", "blue"))
+
+
+ORIG_RE = re.compile(r"\n?\[orig:([^\]]+)\]")
+
+
+def build_note(old_note, new_items, orig):
     stamp = datetime.now(TZ).strftime("%d/%m %H:%M")
     lines = [f"🆕 {len(new_items)} anuncio(s) nuevo(s) · {stamp}"]
     for it in new_items[:5]:
@@ -164,8 +201,8 @@ def build_note(old_note, new_items):
         lines.append(f"… y {len(new_items) - 5} más")
     text = "\n".join(lines)
     if old_note.startswith("🆕"):
-        text += "\n\n— anteriores —\n" + old_note
-    return text[:MAX_NOTE]
+        text += "\n\n— anteriores —\n" + ORIG_RE.sub("", old_note).strip()
+    return text[:MAX_NOTE] + f"\n[orig:{orig}]"
 
 
 def main():
@@ -179,12 +216,14 @@ def main():
 
     if args.url:
         links, sh, state_ws, state = [dict(url=args.url, title="-", row=0, col=0,
-                                           sheetId=0, note="")], None, None, {}
+                                           sheetId=0, note="", bg="")], None, None, {}
+        colors_ws, colors = None, {}
     else:
         sh = open_sheet()
         only = [s for s in os.environ.get("SHEETS", "").split("|") if s]
         links = collect_links(sh, only)
         state_ws, state = load_state(sh)
+        colors_ws, colors = load_colors(sh)
         print(f"{len(links)} enlaces de Mercari encontrados")
     if args.limit:
         links = links[:args.limit]
@@ -225,12 +264,17 @@ def main():
                         status[url] = "lectura anómala (ignorada)"
                     elif new:
                         print(f"   🆕 {len(new)} nuevos")
+                        m = ORIG_RE.search(ln["note"]) if ln["note"].startswith("🆕") else None
+                        orig = m.group(1) if m else rgb_hex(ln.get("bg"))
+                        ckey = f"{ln['sheetId']}|{ln['row']}|{ln['col']}"
+                        if ckey not in colors:  # recordar el color original una sola vez
+                            colors[ckey] = "" if ln["bg"] == hex_color(ALERT_COLOR) else ln["bg"]
                         requests_.append({"updateCells": {
                             "range": {"sheetId": ln["sheetId"], "startRowIndex": ln["row"],
                                       "endRowIndex": ln["row"] + 1, "startColumnIndex": ln["col"],
                                       "endColumnIndex": ln["col"] + 1},
                             "rows": [{"values": [{
-                                "note": build_note(ln["note"], new),
+                                "note": build_note(ln["note"], new, orig),
                                 "userEnteredFormat": {"backgroundColor": ALERT_COLOR}}]}],
                             "fields": "note,userEnteredFormat.backgroundColor"}})
             time.sleep(random.uniform(2.5, 5.5))
@@ -240,6 +284,7 @@ def main():
         if requests_:
             sh.batch_update({"requests": requests_})
         save_state(state_ws, state, status)
+        save_colors(colors_ws, colors)
     print(f"Hecho: {len(requests_)} celdas avisadas, {failures} fallos de {len(links)}")
     if links and failures > len(links) / 2:
         sys.exit(1)  # GitHub te mandará un email de "workflow failed"
