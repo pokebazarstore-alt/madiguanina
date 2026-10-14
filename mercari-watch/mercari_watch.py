@@ -17,6 +17,9 @@ from zoneinfo import ZoneInfo
 STATE_TITLE = "_mercari_estado"
 ALERT_COLOR = {"red": 1.0, "green": 0.84, "blue": 0.35}
 MAX_SEEN = 300
+TARGET_ITEMS = 90
+MAX_ALERT_BATCH = 25  # si salen más 'nuevos' de golpe, se considera lectura anómala
+STATE_VERSION = "2"
 MAX_NOTE = 1800
 NO_RESULT = "出品された商品がありません"
 TZ = ZoneInfo("Europe/Madrid")
@@ -32,7 +35,9 @@ EXTRACT_JS = r"""() => {
     const img = a.querySelector('img');
     let label = (el && el.getAttribute('aria-label')) || a.getAttribute('aria-label')
               || (img && img.alt) || a.innerText || '';
-    out.push({id: m[1], href: a.href, label: label.replace(/\s+/g, ' ').trim().slice(0, 140)});
+    label = label.replace(/\s+/g, ' ').replace(/のサムネイル$/, '').trim().slice(0, 140);
+    const pm = (a.innerText || '').replace(/\s+/g, '').match(/[\d,]{3,}/);
+    out.push({id: m[1], href: a.href, label: label, price: pm ? pm[0] : ''});
   }
   return out;
 }"""
@@ -95,8 +100,13 @@ def load_state(sh):
         ws.update(range_name="A1", values=[["clave", "ids_vistos", "ultima_revision", "estado"]])
         ws.hide()
     state = {}
-    for row in ws.get_all_values()[1:]:
-        if row and row[0]:
+    rows = ws.get_all_values()[1:]
+    version = next((r[1] for r in rows if r and r[0] == "__version__"), None)
+    if version != STATE_VERSION:  # formato antiguo: empezar de cero (sin avisos falsos)
+        print("Estado antiguo detectado: se reinicia el punto de partida")
+        return ws, state
+    for row in rows:
+        if row and row[0] and row[0] != "__version__":
             try:
                 state[row[0]] = json.loads(row[1]) if len(row) > 1 and row[1] else []
             except json.JSONDecodeError:
@@ -106,7 +116,8 @@ def load_state(sh):
 
 def save_state(ws, state, status):
     now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
-    rows = [["clave", "ids_vistos", "ultima_revision", "estado"]]
+    rows = [["clave", "ids_vistos", "ultima_revision", "estado"],
+            ["__version__", STATE_VERSION, now, ""]]
     for k, ids in state.items():
         rows.append([k, json.dumps(ids[:MAX_SEEN]), now, status.get(k, "")])
     ws.clear()
@@ -130,7 +141,16 @@ def scrape(page, url):
     except Exception as e:
         print("   error:", e)
         return None
-    page.wait_for_timeout(1200)
+    page.wait_for_timeout(1000)
+    last = 0
+    for k in range(8):  # baja para que Mercari cargue más anuncios (~90)
+        n = page.locator(ITEM_SELECTOR).count()
+        if n >= TARGET_ITEMS or (k > 0 and n == last):
+            break
+        last = n
+        page.mouse.wheel(0, 5000)
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1100)
     return page.evaluate(EXTRACT_JS)
 
 
@@ -138,7 +158,8 @@ def build_note(old_note, new_items):
     stamp = datetime.now(TZ).strftime("%d/%m %H:%M")
     lines = [f"🆕 {len(new_items)} anuncio(s) nuevo(s) · {stamp}"]
     for it in new_items[:5]:
-        lines.append(f"• {it['label'] or it['id']}\n  {it['href']}")
+        price = f" · ¥{it['price']}" if it.get('price') else ""
+        lines.append(f"• {it['label'] or it['id']}{price}\n  {it['href']}")
     if len(new_items) > 5:
         lines.append(f"… y {len(new_items) - 5} más")
     text = "\n".join(lines)
@@ -199,7 +220,10 @@ def main():
                     new = [it for it in items if it["id"] not in seen]
                     state[url] = ids + [x for x in state[url] if x not in set(ids)]
                     status[url] = f"ok, {len(new)} nuevos"
-                    if new:
+                    if len(new) > MAX_ALERT_BATCH:
+                        print(f"   ⚠ {len(new)} 'nuevos' de golpe: lectura anómala, se ignora")
+                        status[url] = "lectura anómala (ignorada)"
+                    elif new:
                         print(f"   🆕 {len(new)} nuevos")
                         requests_.append({"updateCells": {
                             "range": {"sheetId": ln["sheetId"], "startRowIndex": ln["row"],
