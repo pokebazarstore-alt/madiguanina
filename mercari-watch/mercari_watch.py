@@ -257,7 +257,8 @@ def build_note(pend, ref=None):
     lines = [f"🆕 {len(pend)} anuncio(s) a la venta sin revisar"]
     for p in sorted(pend, key=lambda p: p.get("pos") or 999)[:MAX_LISTED]:
         yen = yen_to_int(p.get("price"))
-        lines.append(f"• Anuncio {p['pos']}" if p.get("pos") else f"• {(p.get('label') or p['id'])[:40]}")
+        seen_at = f" · visto {p['ts']}" if p.get("ts") else ""
+        lines.append((f"• Anuncio {p['pos']}" if p.get("pos") else f"• {(p.get('label') or p['id'])[:40]}") + seen_at)
         lines.append(f"  {fmt_eur(yen)}")
         if SHOW_STATE:
             ai = p.get("ai")
