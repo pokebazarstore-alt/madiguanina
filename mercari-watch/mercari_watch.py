@@ -12,7 +12,7 @@ Uso local de prueba:  python mercari_watch.py --dry-run --limit 3
 """
 import argparse, base64, json, os, random, re, sys, time
 import urllib.parse as up
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 STATE_TITLE = "_mercari_estado"
@@ -257,7 +257,12 @@ def build_note(pend, ref=None):
     lines = [f"🆕 {len(pend)} anuncio(s) a la venta sin revisar"]
     for p in sorted(pend, key=lambda p: p.get("pos") or 999)[:MAX_LISTED]:
         yen = yen_to_int(p.get("price"))
-        seen_at = f" · visto {p['ts']}" if p.get("ts") else ""
+        if p.get("pub"):
+            seen_at = f" · publicado {p['pub']}"
+        elif p.get("pub") is None and p.get("ts"):
+            seen_at = f" · visto {p['ts']}"  # aún sin leer la fecha real
+        else:
+            seen_at = f" · publicado ? (visto {p['ts']})" if p.get("ts") else " · publicado ?"
         lines.append((f"• Anuncio {p['pos']}" if p.get("pos") else f"• {(p.get('label') or p['id'])[:40]}") + seen_at)
         lines.append(f"  {fmt_eur(yen)}")
         if SHOW_STATE:
@@ -353,6 +358,56 @@ def text_condition(text, label=""):
     return {"nota": score, "resumen": "; ".join(parts) or "estimación por descripción"}
 
 
+# ---------------------------------------------------------------- Fecha de publicación
+TOKYO = ZoneInfo("Asia/Tokyo")
+_REL_UNITS = {"分": timedelta(minutes=1), "時間": timedelta(hours=1), "日": timedelta(days=1),
+              "週間": timedelta(weeks=1), "か月": timedelta(days=30), "ヶ月": timedelta(days=30), "カ月": timedelta(days=30)}
+
+
+def _fmt_dt(dt, approx=False):
+    return ("≈" if approx else "") + dt.astimezone(TZ).strftime("%d/%m %H:%M")
+
+
+def parse_published(html, text, item_id, now=None):
+    """Intenta sacar cuándo se publicó el anuncio. Devuelve (texto 'dd/mm HH:MM' | None, fuente)."""
+    now = now or datetime.now(timezone.utc)
+    # 1) metadatos estándar
+    for rx in (r'"datePublished"\s*:\s*"([^"]+)"', r'article:published_time"\s+content="([^"]+)"',
+               r'content="([^"]+)"\s+property="article:published_time"'):
+        m = re.search(rx, html or "")
+        if m:
+            try:
+                dt = datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=TOKYO)
+                return _fmt_dt(dt), "metadatos"
+            except ValueError:
+                pass
+    # 2) JSON incrustado: campo "created" (unix) cerca del id del propio anuncio
+    for m in re.finditer(r'"id"\s*:\s*"' + re.escape(item_id) + '"', html or ""):
+        window = html[max(0, m.start() - 2500): m.end() + 2500]
+        c = re.search(r'"created"\s*:\s*"?(\d{10})"?', window)
+        if c:
+            return _fmt_dt(datetime.fromtimestamp(int(c.group(1)), timezone.utc)), "json"
+    # 3) fecha absoluta visible
+    m = re.search(r"(?:出品日時|出品日|投稿日時?)\D{0,4}(\d{4})[/年.\-](\d{1,2})[/月.\-](\d{1,2})日?\s*(\d{1,2}):(\d{2})", text or "")
+    if m:
+        y, mo, d, h, mi = map(int, m.groups())
+        return _fmt_dt(datetime(y, mo, d, h, mi, tzinfo=TOKYO)), "texto"
+    # 4) tiempo relativo ("3時間前"), solo en líneas que hablen de publicación/actualización
+    for line in (text or "").splitlines()[:80]:
+        if re.search(r"ログイン|コメント|いいね|返信|評価", line):
+            continue
+        r = re.search(r"(\d+)\s*(分|時間|日|週間|か月|ヶ月|カ月)前", line)
+        if r and re.search(r"出品|投稿|更新|前$", line.strip()):
+            return _fmt_dt(now - int(r.group(1)) * _REL_UNITS[r.group(2)], approx=True), "relativo: " + line.strip()[:40]
+    return None, ""
+
+
+def date_hints(text):
+    return [l.strip()[:70] for l in (text or "").splitlines() if re.search(r"前|出品|投稿|日時", l)][:6]
+
+
 # ---------------------------------------------------------------- IA (Gemini)
 AI_PROMPT = (
     "Eres un experto en cartas Pokémon TCG japonesas vintage. Evalúa el ESTADO FÍSICO de la carta "
@@ -378,9 +433,13 @@ def item_context(page, href):
         page.goto(href, wait_until="domcontentloaded", timeout=45000)
         page.wait_for_selector('img[src*="mercdn"]', timeout=15000)
     except Exception:
-        return "", []
+        return "", [], None
     page.wait_for_timeout(800)
     text = page.inner_text("body")[:4000]
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
     srcs = page.evaluate("""() => {
         const id = location.pathname.split('/').pop();
         return [...document.querySelectorAll('img')]
@@ -395,7 +454,13 @@ def item_context(page, href):
         k = int(m.group(1))
         if k not in by_idx or ("/orig/" in u and "/orig/" not in by_idx[k]):
             by_idx[k] = u
-    return text, [by_idx[k] for k in sorted(by_idx)][:AI_MAX_IMAGES]
+    item_id = re.sub(r"\W", "", href.rstrip("/").split("/")[-1].split("?")[0])
+    pub, src = parse_published(html, text, item_id)
+    if pub is None:
+        print(f"   ⚠ sin fecha de publicación ({item_id}); pistas: {date_hints(text)}")
+    else:
+        print(f"   Publicado {pub} (fuente: {src})")
+    return text, [by_idx[k] for k in sorted(by_idx)][:AI_MAX_IMAGES], pub
 
 
 def gemini_assess(text, image_urls, label):
@@ -427,17 +492,20 @@ def gemini_assess(text, image_urls, label):
 
 
 def enrich_items(page, items, budget):
-    """Para cada anuncio pendiente sin análisis: intenta la IA (si hay clave y cupo); si no, estima el
-    estado leyendo la descripción (gratis)."""
+    """Abre cada anuncio pendiente (una vez) para: fecha de publicación, y -si SHOW_STATE- análisis con IA
+    (si hay clave y cupo) o estimación por descripción (gratis)."""
     has_key = bool(os.environ.get("GEMINI_API_KEY"))
     for p in items:
-        if p.get("ai") is not None:
+        can_ai = SHOW_STATE and has_key and budget.left > 0 and not budget.blocked and p.get("ai") is None
+        need_desc = SHOW_STATE and p.get("ai") is None and p.get("desc") is None
+        need_pub = p.get("pub") is None
+        if not (can_ai or need_desc or need_pub):
             continue
-        can_ai = has_key and budget.left > 0 and not budget.blocked
-        need_desc = p.get("desc") is None and budget.desc_left > 0
-        if not can_ai and not need_desc:
+        if not can_ai and budget.desc_left <= 0:
             continue
-        text, urls = item_context(page, p["href"])
+        text, urls, pub = item_context(page, p["href"])
+        if text and p.get("pub") is None:
+            p["pub"] = pub or ""  # "" = intentado y no encontrado (no se reintenta)
         if can_ai:
             try:
                 p["ai"] = gemini_assess(text, urls, p["label"])
@@ -449,13 +517,13 @@ def enrich_items(page, items, budget):
                 print(f"   ⚠ IA falló ({type(e).__name__}); se reintentará")
             budget.left -= 1
             time.sleep(AI_DELAY)
-        if p.get("ai") is None and p.get("desc") is None and budget.desc_left > 0:
-            p["desc"] = text_condition(text, p["label"])
+        else:
             budget.desc_left -= 1
+            time.sleep(1.5)
+        if SHOW_STATE and p.get("ai") is None and p.get("desc") is None and text:
+            p["desc"] = text_condition(text, p["label"])
             if p["desc"]:
                 print(f"   Desc: {p['label'][:30]} → {p['desc']}")
-            if not can_ai:
-                time.sleep(1.5)
 
 
 def cell_range(ln):
@@ -595,7 +663,7 @@ def main():
                 print(f"{tag}: {len(items)} anuncios"
                       + (f" · ej: {items[0]['label'][:50]}" if items else ""))
                 process_link(ln, url, items, state, pending, colors, status, requests_,
-                             enrich=(lambda pend: enrich_items(ai_page, pend, budget)) if SHOW_STATE else None)
+                             enrich=lambda pend: enrich_items(ai_page, pend, budget))
             time.sleep(random.uniform(2.5, 5.5))
         browser.close()
 
