@@ -32,7 +32,8 @@ TARGET_ITEMS = 90
 MAX_ALERT_BATCH = 25  # si salen más 'nuevos' de golpe, se considera lectura anómala
 STATE_VERSION = "2"
 MAX_NOTE = 1800
-MAX_LISTED = 8
+MAX_LISTED = 15
+SHOW_STATE = os.environ.get("SHOW_STATE", "1") == "1"  # 1 = línea de estado (IA/descripción) entre precio y %; 0 = quitarla
 YEN_TO_EUR = float(os.environ.get("YEN_TO_EUR", "0.006"))   # 1000 ¥ = 6 €
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 AI_MAX_PER_RUN = int(os.environ.get("AI_MAX_PER_RUN", "40"))  # tope de análisis por ejecución
@@ -254,23 +255,20 @@ def fmt_eur(yen):
 
 def build_note(pend, ref=None):
     lines = [f"🆕 {len(pend)} anuncio(s) a la venta sin revisar"]
-    for p in pend[:MAX_LISTED]:
+    for p in sorted(pend, key=lambda p: p.get("pos") or 999)[:MAX_LISTED]:
         yen = yen_to_int(p.get("price"))
-        lines.append(f"• {(p['label'] or p['id'])[:70]} ({fmt_eur(yen)})")
-        ai = p.get("ai")
-        if isinstance(ai, dict) and ai.get("nota") is not None:
-            lines.append(f"  IA: {ai['nota']}/10 · {ai.get('resumen', '')}")
-        elif isinstance(ai, dict) and ai.get("resumen"):
-            lines.append(f"  IA: {ai['resumen']}")
-        elif isinstance(p.get("desc"), dict):
-            d = p["desc"]
-            lines.append(f"  Descripción: ~{d['nota']}/10 · {d['resumen']}" if d.get("nota") is not None
-                         else f"  Descripción: {d.get('resumen', '')}")
-        if yen and ref:
-            lines.append(f"  Precio: {yen * YEN_TO_EUR / ref * 100:.0f}% de tu ref. NM ({ref:.0f} €)")
-        elif yen:
-            lines.append("  Precio: sin referencia")
-        lines.append(f"  {p['href']}")
+        lines.append(f"• Anuncio {p['pos']}" if p.get("pos") else f"• {(p.get('label') or p['id'])[:40]}")
+        lines.append(f"  {fmt_eur(yen)}")
+        if SHOW_STATE:
+            ai = p.get("ai")
+            if isinstance(ai, dict) and (ai.get("nota") is not None or ai.get("resumen")):
+                lines.append(f"  IA: {ai['nota']}/10 · {ai.get('resumen', '')}" if ai.get("nota") is not None
+                             else f"  IA: {ai['resumen']}")
+            elif isinstance(p.get("desc"), dict):
+                d = p["desc"]
+                lines.append(f"  Descripción: ~{d['nota']}/10 · {d['resumen']}" if d.get("nota") is not None
+                             else f"  Descripción: {d.get('resumen', '')}")
+        lines.append(f"  {yen * YEN_TO_EUR / ref * 100:.0f}% de mi ref NM" if yen and ref else "  sin ref NM")
     if len(pend) > MAX_LISTED:
         lines.append(f"… y {len(pend) - MAX_LISTED} más")
     return "\n".join(lines)[:MAX_NOTE]
@@ -514,6 +512,10 @@ def process_link(ln, url, items, state, pending, colors, status, requests_, now=
                  ts=now, miss=0) for it in new if it["id"] not in have] + pend
     if new:
         print(f"   🆕 {len(new)} nuevos")
+    posmap = {it["id"]: i + 1 for i, it in enumerate(items)}  # puesto en la lista de la búsqueda
+    for p in pend:
+        p["pos"] = posmap.get(p["id"], p.get("pos"))
+    pend.sort(key=lambda p: p.get("pos") or 999)
     if pend:
         pending[pkey] = pend
     else:
@@ -592,7 +594,7 @@ def main():
                 print(f"{tag}: {len(items)} anuncios"
                       + (f" · ej: {items[0]['label'][:50]}" if items else ""))
                 process_link(ln, url, items, state, pending, colors, status, requests_,
-                             enrich=lambda pend: enrich_items(ai_page, pend, budget))
+                             enrich=(lambda pend: enrich_items(ai_page, pend, budget)) if SHOW_STATE else None)
             time.sleep(random.uniform(2.5, 5.5))
         browser.close()
 
