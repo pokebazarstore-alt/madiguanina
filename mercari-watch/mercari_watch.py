@@ -10,7 +10,7 @@ Variables de entorno: SPREADSHEET_ID, GOOGLE_CREDENTIALS (JSON de la cuenta de s
 SHEETS (opcional, pestañas separadas por "|").
 Uso local de prueba:  python mercari_watch.py --dry-run --limit 3
 """
-import argparse, json, os, random, re, sys, time
+import argparse, base64, json, os, random, re, sys, time
 import urllib.parse as up
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -33,6 +33,12 @@ MAX_ALERT_BATCH = 25  # si salen más 'nuevos' de golpe, se considera lectura an
 STATE_VERSION = "2"
 MAX_NOTE = 1800
 MAX_LISTED = 8
+YEN_TO_EUR = float(os.environ.get("YEN_TO_EUR", "0.006"))   # 1000 ¥ = 6 €
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+AI_MAX_PER_RUN = int(os.environ.get("AI_MAX_PER_RUN", "40"))  # tope de análisis por ejecución
+AI_DELAY = 4.5  # segundos entre llamadas (respeta el límite por minuto de la capa gratuita)
+AI_MAX_IMAGES = 3
+DESC_MAX_PER_RUN = int(os.environ.get("DESC_MAX_PER_RUN", "60"))  # anuncios a leer por descripción (sin IA) por ejecución
 MISS_TO_DROP = 2  # ejecuciones seguidas sin aparecer (vendido/retirado) antes de quitarlo de la nota
 NO_RESULT = "出品された商品がありません"
 TZ = ZoneInfo("Europe/Madrid")
@@ -135,7 +141,7 @@ def save_pending(ws, pending):
 
 def collect_links(sh, only):
     fields = ("sheets(properties(title,sheetId),data(startRow,startColumn,rowData(values("
-              "hyperlink,note,userEnteredFormat/backgroundColor,userEnteredValue/formulaValue,"
+              "hyperlink,note,formattedValue,effectiveValue/numberValue,userEnteredFormat/backgroundColor,userEnteredValue/formulaValue,"
               "textFormatRuns/format/link))))")
     meta = sh.fetch_sheet_metadata(params={"includeGridData": "true", "fields": fields})
     links = []
@@ -145,6 +151,12 @@ def collect_links(sh, only):
             continue
         for d in s.get("data", []):
             r0, c0 = d.get("startRow", 0), d.get("startColumn", 0)
+            price_col = None  # columna cuyo encabezado (fila 1) contiene "PRECIO"
+            if r0 == 0 and d.get("rowData"):
+                for c, cell in enumerate(d["rowData"][0].get("values", [])):
+                    if "PRECIO" in (cell.get("formattedValue") or "").upper():
+                        price_col = c
+                        break
             for r, row in enumerate(d.get("rowData", [])):
                 for c, cell in enumerate(row.get("values", [])):
                     url = cell.get("hyperlink")
@@ -156,7 +168,11 @@ def collect_links(sh, only):
                         m = re.search(r'HYPERLINK\(\s*"([^"]+)"', f, re.I)
                         url = m.group(1) if m else None
                     if url and "mercari.com" in url and "/search" in url:
-                        links.append(dict(sheetId=s["properties"]["sheetId"], title=title,
+                        vals = row.get("values", [])
+                        ref = None
+                        if price_col is not None and price_col < len(vals):
+                            ref = vals[price_col].get("effectiveValue", {}).get("numberValue")
+                        links.append(dict(sheetId=s["properties"]["sheetId"], title=title, ref=ref,
                                           row=r0 + r, col=c0 + c, url=url,
                                           note=cell.get("note", ""),
                                           bg=hex_color(cell.get("userEnteredFormat", {})
@@ -222,14 +238,225 @@ def scrape(page, url):
 
 
 # ---------------------------------------------------------------- Lógica de avisos
-def build_note(pend):
+def yen_to_int(price):
+    try:
+        return int(re.sub(r"[^\d]", "", price or "") or 0) or None
+    except ValueError:
+        return None
+
+
+def fmt_eur(yen):
+    if not yen:
+        return "precio ?"
+    e = yen * YEN_TO_EUR
+    return f"{e:.0f} €" if e >= 10 else f"{e:.1f} €".replace(".", ",")
+
+
+def build_note(pend, ref=None):
     lines = [f"🆕 {len(pend)} anuncio(s) a la venta sin revisar"]
     for p in pend[:MAX_LISTED]:
-        price = f" · ¥{p['price']}" if p.get("price") else ""
-        lines.append(f"• {p['label'] or p['id']}{price}\n  {p['href']}\n  (detectado {p['ts']})")
+        yen = yen_to_int(p.get("price"))
+        lines.append(f"• {(p['label'] or p['id'])[:70]} ({fmt_eur(yen)})")
+        ai = p.get("ai")
+        if isinstance(ai, dict) and ai.get("nota") is not None:
+            lines.append(f"  IA: {ai['nota']}/10 · {ai.get('resumen', '')}")
+        elif isinstance(ai, dict) and ai.get("resumen"):
+            lines.append(f"  IA: {ai['resumen']}")
+        elif isinstance(p.get("desc"), dict):
+            d = p["desc"]
+            lines.append(f"  Descripción: ~{d['nota']}/10 · {d['resumen']}" if d.get("nota") is not None
+                         else f"  Descripción: {d.get('resumen', '')}")
+        if yen and ref:
+            lines.append(f"  Precio: {yen * YEN_TO_EUR / ref * 100:.0f}% de tu ref. NM ({ref:.0f} €)")
+        elif yen:
+            lines.append("  Precio: sin referencia")
+        lines.append(f"  {p['href']}")
     if len(pend) > MAX_LISTED:
         lines.append(f"… y {len(pend) - MAX_LISTED} más")
     return "\n".join(lines)[:MAX_NOTE]
+
+
+# ---------------------------------------------------------------- Estado por descripción (sin IA)
+FIELD_BASE = {  # campo "商品の状態" de Mercari -> (nota, texto)
+    "新品、未使用": (10, "nueva/sin usar"),
+    "未使用に近い": (9, "casi sin usar"),
+    "目立った傷や汚れなし": (8, "sin daños visibles"),
+    "やや傷や汚れあり": (6, "algo dañada"),
+    "傷や汚れあり": (4, "dañada"),
+    "全体的に状態が悪い": (2, "mal estado general"),
+}
+FIELD_RE = re.compile("|".join(sorted(map(re.escape, FIELD_BASE), key=len, reverse=True)))
+NEG_RULES = [  # (regex, penalización, etiqueta en español)
+    (r"白欠け|白かけ|白カケ|フチ白|縁白|エッジ傷", 1, "bordes blanqueados"),
+    (r"角(潰れ|つぶれ|ツブレ|傷|スレ|折れ)", 1, "esquinas dañadas"),
+    (r"折れ|折り目|折目|曲がり|反り|シワ|しわ|皺|ヨレ|歪み", 2, "dobleces/arrugas"),
+    (r"擦れ|スレ|こすれ", 1, "roces"),
+    (r"キズ|傷|きず|スクラッチ|ひっかき|引っかき", 1, "arañazos"),
+    (r"汚れ|シミ|しみ|黄ばみ|ヤケ|日焼け|変色", 1, "manchas/amarilleo"),
+    (r"凹み|ヘコミ|へこみ|打痕", 1, "abolladuras"),
+    (r"水濡れ|ペン書き|落書き|破れ|破損|ダメージ|剥がれ|ベタつき", 2, "daños graves"),
+    (r"ジャンク|状態悪|プレイ用|プレー用|ボロボロ", 3, "muy jugada"),
+]
+POS_RE = re.compile(r"美品|極美品|綺麗|きれい|キレイ")
+_NEG_WORDS = r"(?:傷|キズ|きず|汚れ|スレ|擦れ|白欠け|白かけ|折れ|シワ|しわ|ヨレ|角潰れ|ダメージ|破れ|凹み|シミ|ヤケ)"
+_NO = r"(?:は|等は|などは|も)?\s*(?:ありません|ございません|なし|無し|ないです|ない|見られません|見当たりません|気になりません|ほぼありません)"
+NEGATED_RES = [
+    re.compile(r"(?:目立った)?(?:傷|キズ)(?:や|・|、|と)(?:汚れ|スレ|擦れ)" + _NO),
+    re.compile(_NEG_WORDS + _NO),
+]
+GRADE_RE = re.compile(r"(PSA|BGS|ARS|CGC)\s*(\d+(?:\.\d)?)", re.I)
+
+
+def description_region(text):
+    i = text.find("商品の説明")
+    if i < 0:
+        return text
+    j = text.find("商品の情報", i)
+    return text[i:j] if j > i else text[i:i + 1500]
+
+
+def text_condition(text, label=""):
+    """Estado aproximado a partir del campo de estado de Mercari y las palabras de la descripción.
+    Devuelve {"nota": int|None, "resumen": str}."""
+    if not text:
+        return None
+    field = FIELD_RE.search(text)
+    base, field_es = FIELD_BASE[field.group(0)] if field else (None, None)
+    body = FIELD_RE.sub(" ", description_region(text))
+    g = GRADE_RE.search(label + " " + body)
+    if g:
+        n = min(10, max(1, round(float(g.group(2)))))
+        return {"nota": n, "resumen": f"gradada {g.group(1).upper()} {g.group(2)}"}
+    if re.search(r"まとめ売り|\d+枚セット|大量|まとめて", label + " " + body):
+        return {"nota": None, "resumen": "parece un lote; revisa las fotos"}
+    clean = body
+    for rx in NEGATED_RES:
+        clean = rx.sub(" ", clean)
+    flags, penalty = [], 0
+    for rx, w, name in NEG_RULES:
+        if re.search(rx, clean):
+            flags.append(name)
+            penalty += w
+    bonus = 1 if POS_RE.search(clean) else 0
+    if base is None and not flags and not bonus:
+        return {"nota": None, "resumen": "sin datos de estado en la descripción"}
+    # con estado del vendedor, la descripción solo matiza (media penalización): ya cuenta en su base
+    pen = min(penalty, 5) if base is None else (min(penalty, 5) + 1) // 2
+    score = (base if base is not None else 7) + bonus - pen
+    score = max(1, min(10, score))
+    parts = []
+    if field_es:
+        parts.append(f"declarada {field_es}")
+    if flags:
+        parts.append("menciona " + ", ".join(flags[:3]))
+    elif bonus:
+        parts.append("descripción positiva")
+    return {"nota": score, "resumen": "; ".join(parts) or "estimación por descripción"}
+
+
+# ---------------------------------------------------------------- IA (Gemini)
+AI_PROMPT = (
+    "Eres un experto en cartas Pokémon TCG japonesas vintage. Evalúa el ESTADO FÍSICO de la carta "
+    "a partir de las fotos de un anuncio de Mercari y del texto (en japonés). Escala: 10 = perfecta "
+    "(Near Mint), 7-8 = ligeros defectos, 5-6 = desgaste visible, 3-4 = muy jugada, 1-2 = destrozada. "
+    "Fíjate en bordes blanqueados, esquinas, arrugas o dobleces, arañazos en el holo, manchas, "
+    "humedad, deformación o escritura. Si el anuncio es un lote o las fotos no permiten juzgar, "
+    "usa nota null y explícalo. Responde SOLO con JSON: "
+    '{"nota": <entero 1-10 o null>, "resumen": "<máximo 14 palabras en español>"}.'
+)
+
+
+class AIBudget:
+    def __init__(self, n, desc=None):
+        self.left = n
+        self.desc_left = DESC_MAX_PER_RUN if desc is None else desc
+        self.blocked = False  # se activa si Gemini devuelve límite alcanzado (429)
+
+
+def item_context(page, href):
+    """Abre el anuncio y devuelve (texto visible, [urls de fotos])."""
+    try:
+        page.goto(href, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_selector('img[src*="mercdn"]', timeout=15000)
+    except Exception:
+        return "", []
+    page.wait_for_timeout(800)
+    text = page.inner_text("body")[:4000]
+    srcs = page.evaluate("""() => {
+        const id = location.pathname.split('/').pop();
+        return [...document.querySelectorAll('img')]
+          .map(i => i.currentSrc || i.src || '')
+          .filter(s => s.includes('mercdn') && s.includes(id));
+    }""")
+    by_idx = {}
+    for u in srcs:
+        m = re.search(r"_(\d+)\.(?:jpe?g|png|webp)", u)
+        if not m:
+            continue
+        k = int(m.group(1))
+        if k not in by_idx or ("/orig/" in u and "/orig/" not in by_idx[k]):
+            by_idx[k] = u
+    return text, [by_idx[k] for k in sorted(by_idx)][:AI_MAX_IMAGES]
+
+
+def gemini_assess(text, image_urls, label):
+    import requests
+    parts = [{"text": f"{AI_PROMPT}\n\nTítulo: {label}\nTexto del anuncio:\n{text[:1800]}"}]
+    for u in image_urls:
+        try:
+            r = requests.get(u, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            if r.ok and len(r.content) < 5_000_000:
+                parts.append({"inline_data": {"mime_type": r.headers.get("content-type", "image/jpeg").split(";")[0],
+                                              "data": base64.b64encode(r.content).decode()}})
+        except Exception:
+            pass
+    if len(parts) == 1:
+        return {"nota": None, "resumen": "sin fotos legibles"}
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+        headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"], "Content-Type": "application/json"},
+        json={"contents": [{"parts": parts}],
+              "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}},
+        timeout=90)
+    if resp.status_code == 429:
+        raise RuntimeError("limit")
+    resp.raise_for_status()
+    out = json.loads(resp.json()["candidates"][0]["content"]["parts"][0]["text"])
+    nota = out.get("nota")
+    return {"nota": int(nota) if isinstance(nota, (int, float)) else None,
+            "resumen": str(out.get("resumen", ""))[:120]}
+
+
+def enrich_items(page, items, budget):
+    """Para cada anuncio pendiente sin análisis: intenta la IA (si hay clave y cupo); si no, estima el
+    estado leyendo la descripción (gratis)."""
+    has_key = bool(os.environ.get("GEMINI_API_KEY"))
+    for p in items:
+        if p.get("ai") is not None:
+            continue
+        can_ai = has_key and budget.left > 0 and not budget.blocked
+        need_desc = p.get("desc") is None and budget.desc_left > 0
+        if not can_ai and not need_desc:
+            continue
+        text, urls = item_context(page, p["href"])
+        if can_ai:
+            try:
+                p["ai"] = gemini_assess(text, urls, p["label"])
+                print(f"   IA: {p['label'][:30]} → {p['ai']}")
+            except RuntimeError:
+                budget.blocked = True
+                print("   ⚠ Gemini: límite alcanzado; el resto usa la descripción y se analiza luego")
+            except Exception as e:
+                print(f"   ⚠ IA falló ({type(e).__name__}); se reintentará")
+            budget.left -= 1
+            time.sleep(AI_DELAY)
+        if p.get("ai") is None and p.get("desc") is None and budget.desc_left > 0:
+            p["desc"] = text_condition(text, p["label"])
+            budget.desc_left -= 1
+            if p["desc"]:
+                print(f"   Desc: {p['label'][:30]} → {p['desc']}")
+            if not can_ai:
+                time.sleep(1.5)
 
 
 def cell_range(ln):
@@ -237,7 +464,7 @@ def cell_range(ln):
             "startColumnIndex": ln["col"], "endColumnIndex": ln["col"] + 1}
 
 
-def process_link(ln, url, items, state, pending, colors, status, requests_, now=None):
+def process_link(ln, url, items, state, pending, colors, status, requests_, now=None, enrich=None):
     """Actualiza estado/pendientes de un enlace con la lectura `items` (lista) y añade a
     `requests_` los cambios de nota/color necesarios. Devuelve nº de anuncios nuevos."""
     now = now or datetime.now(TZ).strftime("%d/%m %H:%M")
@@ -292,8 +519,10 @@ def process_link(ln, url, items, state, pending, colors, status, requests_, now=
     else:
         pending.pop(pkey, None)
 
+    if pend and enrich:
+        enrich(pend)
     if pend:
-        note = build_note(pend)
+        note = build_note(pend, ln.get("ref"))
         color = alert_color(len(pend))
         if note != ln["note"] or ln["bg"] != hex_color(color):
             if ckey not in colors:  # recordar el color original una sola vez
@@ -348,6 +577,8 @@ def main():
         ctx.route("**/*", lambda r: r.abort()
                   if r.request.resource_type in ("image", "media", "font") else r.continue_())
         page = ctx.new_page()
+        ai_page = ctx.new_page()
+        budget = AIBudget(AI_MAX_PER_RUN)
 
         for i, ln in enumerate(links, 1):
             url = normalize_url(ln["url"])
@@ -360,7 +591,8 @@ def main():
             else:
                 print(f"{tag}: {len(items)} anuncios"
                       + (f" · ej: {items[0]['label'][:50]}" if items else ""))
-                process_link(ln, url, items, state, pending, colors, status, requests_)
+                process_link(ln, url, items, state, pending, colors, status, requests_,
+                             enrich=lambda pend: enrich_items(ai_page, pend, budget))
             time.sleep(random.uniform(2.5, 5.5))
         browser.close()
 
