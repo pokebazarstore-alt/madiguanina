@@ -25,7 +25,8 @@ jobs:
           cache-dependency-path: mercari-watch/requirements.txt
       - run: pip install -r requirements.txt
       - run: python -m playwright install --with-deps chromium
-      - run: python mercari_watch.py
+      - run: python -u mercari_watch.py
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
